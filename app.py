@@ -27,35 +27,32 @@ if 'end_b' not in st.session_state:
     st.session_state.end_b = None
 
 # =================================================================
-# IMAGE PROCESSING & OPENCV LOGIC
+# IMAGE ENHANCEMENT & BLUR DETECTION
 # =================================================================
-def apply_digital_zoom_and_focus(frame, zoom_factor=1.0, y_shift=0):
-    """Crops and rescales image to simulate camera zoom and vertical focus alignment."""
-    if zoom_factor <= 1.0 and y_shift == 0:
-        return frame
+def check_blurriness(frame):
+    """Calculates focus clarity using Laplacian variance. Returns score."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    h, w = frame.shape[:2]
-    new_h = int(h / zoom_factor)
-    new_w = int(w / zoom_factor)
-
-    cy = int(h / 2) + int(y_shift * (h / 100.0))
-    cx = int(w / 2)
-
-    y1 = max(0, min(h - new_h, cy - new_h // 2))
-    x1 = max(0, min(w - new_w, cx - new_w // 2))
-
-    cropped = frame[y1 : y1 + new_h, x1 : x1 + new_w]
-    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+def sharpen_frame(frame):
+    """Applies an unsharp mask kernel to crisp wire edges and color boundaries."""
+    kernel = np.array([[0, -1, 0], 
+                       [-1, 5, -1], 
+                       [0, -1, 0]])
+    return cv2.filter2D(frame, -1, kernel)
 
 def preprocess_image(roi):
     """Enhance contrast and normalize lighting using CLAHE."""
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     cl = clahe.apply(l)
     limg = cv2.merge((cl, a, b))
     return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
+# =================================================================
+# OPENCV WIRE SCANNING LOGIC
+# =================================================================
 def classify_wire(wire_roi):
     if wire_roi.size == 0:
         return "Unknown"
@@ -204,16 +201,11 @@ st.subheader(f"Scanning: END {st.session_state.current_end}")
 left_col, right_col = st.columns([1, 1])
 
 with left_col:
-    st.markdown("#### 1. Input & Controls")
+    st.markdown("#### 1. Input")
     input_method = st.radio("Select Input Method:", ["📷 Camera", "📁 Upload Image"], horizontal=True)
-
-    # Zoom & Focus Offset Sliders
-    zoom_factor = st.slider("🔍 Digital Zoom", min_value=1.0, max_value=4.0, value=1.0, step=0.1)
-    y_shift = st.slider("🎯 Focus Height Offset", min_value=-30, max_value=30, value=0, step=2)
 
     img_file_buffer = None
     if input_method == "📷 Camera":
-        # Touch 'n Go style scanner target box CSS overlay
         st.markdown("""
             <style>
                 div[data-testid="stCameraInput"] {
@@ -250,17 +242,21 @@ with right_col:
         image = Image.open(img_file_buffer)
         raw_frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
-        # Apply digital zoom and height pan
-        zoomed_frame = apply_digital_zoom_and_focus(raw_frame, zoom_factor, y_shift)
+        # Check blur status
+        blur_score = check_blurriness(raw_frame)
+        if blur_score < 70.0:
+            st.warning("⚠️ **Image is Blurry!** Hold the camera ~15–20 cm away so your lens can auto-focus properly.")
 
-        # Contour-based detection
-        sequence, annotated_frame = detect_wire_sequence_contours(zoomed_frame)
+        # Apply software edge sharpening
+        sharpened_frame = sharpen_frame(raw_frame)
+
+        # Contour detection
+        sequence, annotated_frame = detect_wire_sequence_contours(sharpened_frame)
         standard = identify_standard(sequence)
 
-        # Scaled image preview
         st.image(
             cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), 
-            caption="Processed Wire Region", 
+            caption=f"Sharpened Scan View (Clarity Index: {int(blur_score)})", 
             width=360
         )
 
@@ -271,7 +267,7 @@ with right_col:
             st.warning("No clear wire strands detected.")
 
         if len(sequence) < 8:
-            st.warning(f"Detected {len(sequence)}/8 wires. Adjust Zoom & Focus Height sliders to center the wire tips.")
+            st.info("Ensure all 8 bare wire tips are spread out flat with good overhead lighting.")
         elif standard:
             st.success(f"Detected Standard: **{standard}**")
             if st.button(f"Save as END {st.session_state.current_end}"):
