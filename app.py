@@ -27,116 +27,79 @@ if 'end_b' not in st.session_state:
     st.session_state.end_b = None
 
 # =================================================================
-# ENHANCED OPENCV & COLOR DETECTION LOGIC
+# IMPROVED OPENCV LOGIC
 # =================================================================
-def preprocess_image(roi):
-    """Normalize lighting using CLAHE on the L channel in LAB color space."""
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-
 def classify_wire(wire_roi):
     if wire_roi.size == 0:
         return "Unknown"
 
-    wire_roi = preprocess_image(wire_roi)
     hsv = cv2.cvtColor(wire_roi, cv2.COLOR_BGR2HSV)
     
+    # Adjusted HSV ranges for realistic lighting/shadows
     masks = {
-        "Orange": cv2.inRange(hsv, np.array([5, 80, 60]), np.array([25, 255, 255])),
-        "Green": cv2.inRange(hsv, np.array([35, 40, 40]), np.array([85, 255, 255])),
-        "Blue": cv2.inRange(hsv, np.array([90, 50, 40]), np.array([130, 255, 255])),
-        "Brown": cv2.inRange(hsv, np.array([2, 40, 20]), np.array([20, 255, 180]))
+        "Orange": cv2.inRange(hsv, np.array([5, 100, 80]), np.array([25, 255, 255])),
+        "Green": cv2.inRange(hsv, np.array([35, 60, 40]), np.array([85, 255, 255])),
+        "Blue": cv2.inRange(hsv, np.array([90, 70, 40]), np.array([130, 255, 255])),
+        "Brown": cv2.inRange(hsv, np.array([5, 40, 20]), np.array([20, 255, 180]))
     }
 
     scores = {}
-    total_pixels = max(hsv.shape[0] * hsv.shape[1], 1)
+    total_pixels = hsv.shape[0] * hsv.shape[1]
 
     for name, mask in masks.items():
-        scores[name] = cv2.countNonZero(mask) / total_pixels
+        scores[name] = cv2.countNonZero(mask) / max(total_pixels, 1)
 
     best_colour = max(scores, key=scores.get)
     best_score = scores[best_colour]
 
-    if best_score < 0.20:
-        return "Unknown"
+    # Check for white stripe (low saturation + high brightness)
+    white_mask = cv2.inRange(hsv, np.array([0, 0, 160]), np.array([180, 60, 255]))
+    white_score = cv2.countNonZero(white_mask) / max(total_pixels, 1)
 
-    # Stripe Detection (white content threshold)
-    white_mask = cv2.inRange(hsv, np.array([0, 0, 140]), np.array([180, 70, 255]))
-    white_score = cv2.countNonZero(white_mask) / total_pixels
+    if white_score > 0.15:
+        if best_colour in ["Green", "Orange", "Brown", "Blue"]:
+            return f"White/{best_colour}"
 
-    if white_score > 0.12:
-        if best_colour == "Green": return "White/Green"
-        elif best_colour == "Orange": return "White/Orange"
-        elif best_colour == "Brown": return "White/Brown"
-        elif best_colour == "Blue": return "White/Blue"
+    if best_score > 0.20:
+        return best_colour
 
-    return best_colour
+    return "Unknown"
 
-def detect_wire_sequence_contours(frame):
-    """Detects individual wire strands via contours and sorts them left-to-right."""
-    height, width = frame.shape[:2]
-    
-    # Target upper section where wire tips spread out
-    roi_y1, roi_y2 = int(height * 0.15), int(height * 0.60)
-    roi_x1, roi_x2 = int(width * 0.10), int(width * 0.90)
-    roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-
+def detect_wire_sequence_contours(frame, x1, y1, x2, y2):
+    roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
-        return [], frame
+        return [], []
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    
-    # Mask colorful wire components vs neutral background
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    wire_mask = cv2.bitwise_or(
-        cv2.inRange(sat, 30, 255),
-        cv2.inRange(val, 150, 255)
-    )
+    # Noise reduction
+    blurred = cv2.GaussianBlur(roi, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-    # Clean noise with morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    wire_mask = cv2.morphologyEx(wire_mask, cv2.MORPH_OPEN, kernel)
+    # Detect non-background wire regions (saturated colors + white)
+    color_mask = cv2.inRange(hsv, np.array([0, 30, 40]), np.array([180, 255, 255]))
+    white_mask = cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 60, 255]))
+    wire_mask = cv2.bitwise_or(color_mask, white_mask)
 
+    # Find distinct wire contours
     contours, _ = cv2.findContours(wire_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     wire_blobs = []
-    min_area = (roi.shape[0] * roi.shape[1]) * 0.001
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 150:  # Filter out tiny noise
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            # Ensure contour resembles a vertical wire segment
+            if bh > 15:
+                wire_sample = roi[by:by+bh, bx:bx+bw]
+                color = classify_wire(wire_sample)
+                wire_blobs.append((bx, color, (bx, by, bw, bh)))
 
-    for c in contours:
-        if cv2.contourArea(c) > min_area:
-            x, y, w, h = cv2.boundingRect(c)
-            # Filter out non-wire shapes
-            if h > 15 and w < int(roi.shape[1] * 0.25):
-                wire_blobs.append((x, y, w, h))
+    # Sort wires from Left to Right based on X position
+    wire_blobs.sort(key=lambda b: b[0])
 
-    # Sort wires from left to right based on X coordinate
-    wire_blobs = sorted(wire_blobs, key=lambda b: b[0])
+    sequence = [blob[1] for blob in wire_blobs[:8]]
+    boxes = [(x1 + b[2][0], y1 + b[2][1], b[2][2], b[2][3]) for b in wire_blobs[:8]]
 
-    display_frame = frame.copy()
-    sequence = []
-
-    for (x, y, w, h) in wire_blobs:
-        abs_x = roi_x1 + x
-        abs_y = roi_y1 + y
-        wire_roi = frame[abs_y:abs_y+h, abs_x:abs_x+w]
-        
-        color = classify_wire(wire_roi)
-        if color != "Unknown":
-            sequence.append(color)
-            # Draw bounding box over recognized wire
-            cv2.rectangle(display_frame, (abs_x, abs_y), (abs_x + w, abs_y + h), (0, 255, 0), 2)
-            cv2.putText(display_frame, str(len(sequence)), (abs_x, abs_y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        if len(sequence) == 8:
-            break
-
-    return sequence, display_frame
+    return sequence, boxes
 
 def identify_standard(sequence):
     if len(sequence) != 8:
@@ -160,7 +123,7 @@ st.set_page_config(page_title="Cable Smart Wiring Scanner", layout="wide")
 st.title("🔌 Cable Smart Wiring Scanner")
 st.markdown("Automatic Network Cable Detection System")
 
-# Results Header
+# Results Dashboard
 st.markdown("---")
 col1, col2, col3 = st.columns(3)
 
@@ -189,7 +152,9 @@ if st.session_state.end_a and st.session_state.end_b:
     st.info("Cable analysis completed. Reset the scanner to test a new cable.")
     st.stop()
 
+# Scanning Area
 st.subheader(f"Scanning: END {st.session_state.current_end}")
+st.write("Lay all 8 bare wires flat and straight inside the green detection box.")
 
 input_method = st.radio("Select Input Method:", ["📷 Camera", "📁 Upload Image"], horizontal=True)
 
@@ -202,40 +167,51 @@ else:
 if img_file_buffer is not None:
     image = Image.open(img_file_buffer)
     frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    height, width = frame_bgr.shape[:2]
 
-    # Process image with dynamic contour scanning
-    sequence, annotated_frame = detect_wire_sequence_contours(frame_bgr)
+    # Focused bounding area for wire detection
+    box_width = int(width * 0.70)
+    box_height = int(height * 0.50)
+    x1 = int((width - box_width) / 2)
+    y1 = int(height * 0.15)
+    x2 = x1 + box_width
+    y2 = y1 + box_height
+
+    display_frame = frame_bgr.copy()
+    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(display_frame, "DETECTION AREA", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # Perform contour wire detection
+    sequence, boxes = detect_wire_sequence_contours(frame_bgr, x1, y1, x2, y2)
+
+    # Draw detected wire contours on image
+    for bx, by, bw, bh in boxes:
+        cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), (255, 0, 0), 2)
+
+    # Rescale image preview display using Streamlit columns
+    left_pad, center_col, right_pad = st.columns([1, 2, 1])
+    with center_col:
+        st.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB), caption="Wire Detection Preview", width=450)
+
     standard = identify_standard(sequence)
 
-    # Split display into 2 compact columns to limit picture size
-    img_col, info_col = st.columns([1, 1])
+    st.markdown("### Live Wire Detection")
+    if sequence:
+        seq_display = "\n".join([f"- **Pin {i+1}:** {color}" for i, color in enumerate(sequence)])
+        st.markdown(seq_display)
+    else:
+        st.warning("No wires detected in ROI. Reposition the cable closer to the green box.")
 
-    with img_col:
-        # Fixed width limits image scale on screen
-        st.image(
-            cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), 
-            caption="Detected Wires (Left to Right)", 
-            width=400
-        )
-
-    with info_col:
-        st.markdown("### Detection Live Results")
-        if sequence:
-            for i, color in enumerate(sequence):
-                st.write(f"**Pin {i+1}:** {color}")
-        else:
-            st.warning("No clear wire strands detected.")
-
-        if len(sequence) < 8:
-            st.warning(f"Detected {len(sequence)}/8 wires. Ensure wires are well-lit and separated.")
-        elif standard:
-            st.success(f"Detected Standard: **{standard}**")
-            if st.button(f"Save as END {st.session_state.current_end}"):
-                if st.session_state.current_end == 'A':
-                    st.session_state.end_a = standard
-                    st.session_state.current_end = 'B'
-                else:
-                    st.session_state.end_b = standard
-                st.rerun()
-        else:
-            st.error("Wire sequence detected, but order does not match T568A or T568B standard.")
+    if len(sequence) < 8 or "Unknown" in sequence:
+        st.error(f"Detected {len(sequence)}/8 clear wires. Improve lighting, straighten wires, and align them inside the green box.")
+    elif standard:
+        st.success(f"Detected Standard: **{standard}**")
+        if st.button(f"Save as END {st.session_state.current_end}"):
+            if st.session_state.current_end == 'A':
+                st.session_state.end_a = standard
+                st.session_state.current_end = 'B'
+            else:
+                st.session_state.end_b = standard
+            st.rerun()
+    else:
+        st.error("The detected sequence does not match T568A or T568B standards.")
